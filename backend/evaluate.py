@@ -1,0 +1,171 @@
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import pandas as pd
+from sklearn.metrics import f1_score, precision_score, recall_score
+
+from anomaly import detect, event_table
+from config import BASE, CPU_THRESHOLD, DATA_PATH, N_DAYS, PLOT_DIR, SERVERS
+from forecast import disk_table, mae_rmse, predict_cpu, sarima_compare
+from risk import assess
+
+
+def prf(y, p):
+    return (precision_score(y, p, zero_division=0), recall_score(y, p, zero_division=0),
+            f1_score(y, p, zero_division=0))
+
+
+def compare_models(y, flag):
+    return dict(zip(("precision", "recall", "f1"), prf(y, flag)))
+
+
+def plot(m, thresholds):
+    d = m[m.server == "server-02"]
+    d = d[d.timestamp < d.timestamp.min() + pd.Timedelta(days=3)]
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13, 6.5), sharex=True, height_ratios=[3, 1])
+    ax1.plot(d.timestamp, d.cpu, lw=.8, color="#2563eb", label="CPU %")
+    ax1.plot(d.timestamp + pd.Timedelta(minutes=30), d.pred, lw=.9, ls="--", color="#f59e0b", label="forecast +30 min")
+    f = d[d.if_flag == 1]
+    ax1.scatter(f.timestamp, f.cpu, s=14, color="#ef4444", zorder=3, label="anomaly flag")
+    for kind, g in d[d.is_anomaly == 1].groupby("anomaly_type"):
+        ax1.axvspan(g.timestamp.min(), g.timestamp.max(), color="#ef4444", alpha=.12, label=f"labeled: {kind}")
+    ax1.axhline(CPU_THRESHOLD, ls=":", lw=.8, color="#6b7280")
+    ax1.set_ylim(0, 100)
+    ax1.set_ylabel("CPU %")
+    ax1.set_title("server-02 - test period (first 3 days): anomaly flags vs +30 min forecast")
+    ax1.legend(ncol=3, fontsize=8, frameon=False, loc="upper left")
+    ax2.plot(d.timestamp, d.anomaly_score, lw=.7, color="#7c3aed")
+    ax2.axhline(thresholds["server-02"], ls=":", lw=.8, color="#6b7280")
+    ax2.set_ylabel("score")
+    fig.tight_layout()
+    out = PLOT_DIR / "server-02_test.png"
+    PLOT_DIR.mkdir(exist_ok=True)
+    fig.savefig(out, dpi=130)
+    return out
+
+
+def main():
+    df = pd.read_parquet(DATA_PATH)
+    scored, thresholds = detect(df)
+    te = scored[scored.split == "test"].reset_index(drop=True)
+    y = te.is_anomaly.to_numpy()
+    overall = pd.DataFrame([{"model": "IsolationForest", **compare_models(y, te.if_flag)},
+                            {"model": f"CPU>{CPU_THRESHOLD}", **compare_models(y, te.baseline_flag)}])
+    overall = overall.set_index("model").round(3)
+
+    rows = []
+    for kind, g in te[te.is_anomaly == 1].groupby("anomaly_type"):
+        yk = (te.anomaly_type == kind).to_numpy()
+        ev, evb = event_table(g, "if_flag"), event_table(g, "baseline_flag")
+        rows.append(dict(type=kind, points=len(g),
+                         if_p=prf(yk, te.if_flag)[0], if_r=prf(yk, te.if_flag)[1], if_f1=prf(yk, te.if_flag)[2],
+                         base_p=prf(yk, te.baseline_flag)[0], base_r=prf(yk, te.baseline_flag)[1],
+                         base_f1=prf(yk, te.baseline_flag)[2],
+                         events=len(ev), if_events=int(ev.detected.sum()), base_events=int(evb.detected.sum()),
+                         if_delay=round(ev.delay.median(), 1) if ev.detected.any() else None))
+    per_type = pd.DataFrame(rows).set_index("type")
+    per_type[["if_p", "if_r", "if_f1", "base_p", "base_r", "base_f1"]] = per_type[
+        ["if_p", "if_r", "if_f1", "base_p", "base_r", "base_f1"]].round(2)
+
+    ev_all = pd.concat([event_table(g, "if_flag") for _, g in te[te.is_anomaly == 1].groupby("anomaly_type")])
+    ev_base = pd.concat([event_table(g, "baseline_flag") for _, g in te[te.is_anomaly == 1].groupby("anomaly_type")])
+    event_line = (f"IF: {int(ev_all.detected.sum())}/{len(ev_all)} events, median delay "
+                  f"{ev_all.delay.median():.1f} min | CPU>{CPU_THRESHOLD}: "
+                  f"{int(ev_base.detected.sum())}/{len(ev_base)} events")
+
+    tests = predict_cpu(df)
+    keys = ("naive_mae", "naive_rmse", "xgb_mae", "xgb_rmse")
+    frows = [dict(server=s, **dict(zip(keys, (*mae_rmse(t.target, t.cpu), *mae_rmse(t.target, t.pred)))))
+             for s, t in tests.items()]
+    allte = pd.concat(tests.values())
+    frows.append(dict(server="ALL", **dict(zip(keys, (*mae_rmse(allte.target, allte.cpu),
+                                                      *mae_rmse(allte.target, allte.pred))))))
+    fc_cpu = pd.DataFrame(frows).set_index("server").round(2)
+    fc_sarima = sarima_compare(df, tests)
+    fc_disk = disk_table(df)
+
+    m = pd.concat([t.assign(server=s) for s, t in tests.items()]).merge(
+        scored[scored.split == "test"][["timestamp", "server", "anomaly_score", "if_flag"]],
+        on=["timestamp", "server"], how="inner")
+    sev = pd.Series([assess(r.cpu, r.anomaly_score, r.pred, r.if_flag)[0] for r in m.itertuples()])
+    risk = pd.DataFrame({"points": sev.value_counts(), "share_pct": (sev.value_counts() / len(m) * 100).round(2)})
+    risk = risk.reindex(["LOW", "MEDIUM", "HIGH"])
+
+    plot_path = plot(m, thresholds)
+
+    md = f"""# AI-Powered Infrastructure Anomaly Detection & Forecasting - Results
+
+Generated by `backend/evaluate.py` on synthetic data ({len(SERVERS)} servers, {N_DAYS} days, 1-min). Anomaly metrics use the held-out
+last 25% (test, {len(te):,} points); forecasts use the chronological last 20% ({len(allte):,} points).
+
+## 1. Anomaly detection (test)
+
+Per-server thresholds (99.5th percentile of normal validation scores): `{thresholds}`
+
+```
+{overall.to_string()}
+```
+
+Event-wise: {event_line}
+
+### Per anomaly type (one-vs-rest precision; flags are not typed)
+
+```
+{per_type.to_string()}
+```
+
+## 2. Forecasting
+
+### CPU, 30 min ahead (1-min origins)
+
+```
+{fc_cpu.to_string()}
+```
+
+### server-01, small SARIMA comparison (30-min grid)
+
+```
+{fc_sarima.to_string()}
+```
+
+### Disk, trend vs naive (MAE/RMSE in percentage points, daily origins)
+
+```
+{fc_disk.to_string()}
+```
+
+## 3. Risk engine (test)
+
+```
+{risk.to_string()}
+```
+
+Rules: HIGH if anomaly score >= 0.90 or CPU at/forecast above {CPU_THRESHOLD}%; MEDIUM if flagged by the detector or
+CPU trending >= 80%; else LOW.
+
+## 4. Notes
+
+- The slow memory leak is not caught at the 0.5% false-positive operating point; normal daytime memory overlaps its level.
+- SARIMA targets the next 30-min mean; naive and XGBoost are scored at the same origins but XGBoost predicts the point at +30 min.
+- No CPU forecast crossed {CPU_THRESHOLD}% during the test window, so the risk engine's forecast-crossing HIGH branch is untested on this slice.
+
+![server-02 test period](backend/plots/server-02_test.png)
+"""
+    (BASE.parent / "results.md").write_text(md, encoding="utf-8")
+
+    print(overall.to_string())
+    print(f"\n{event_line}\n")
+    print(per_type.to_string())
+    print("\nCPU 30-min forecast:")
+    print(fc_cpu.to_string())
+    print("\nSARIMA (server-01, 30-min grid):")
+    print(fc_sarima.to_string())
+    print("\nDisk trend vs naive:")
+    print(fc_disk.to_string())
+    print("\nRisk:")
+    print(risk.to_string())
+    print(f"\nwrote {BASE.parent / 'results.md'}\nplot  {plot_path}")
+
+
+if __name__ == "__main__":
+    main()
